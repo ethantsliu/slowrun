@@ -23,7 +23,9 @@ python prepare_data.py
 torchrun --standalone --nproc_per_node=8 train.py
 ```
 
-## Leaderboards
+## World Record History
+
+We accept PRs that achieve a new World Record validation loss within the track's time limit, and add an entry below for each improvement.
 
 ### Limited Compute 
 
