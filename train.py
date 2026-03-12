@@ -57,6 +57,14 @@ parser.add_argument("--dupe-layers-start", type=int, default=15,
                     help="First decoder layer to duplicate (inclusive)")
 parser.add_argument("--dupe-layers-end", type=int, default=21,
                     help="Last decoder layer to duplicate (exclusive)")
+parser.add_argument("--smoke-test", action="store_true", help="Run a tiny model for local validation")
+parser.add_argument("--max-steps", type=int, default=-1, help="Stop after N steps")
+parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "magma"], help="Optimizer for matrix parameters")
+parser.add_argument("--magma-p", type=float, default=0.5, help="Survival probability for Magma")
+parser.add_argument("--magma-tau", type=float, default=2.0, help="Temperature for Magma alignment score")
+parser.add_argument("--magma-beta", type=float, default=0.1, help="EMA coefficient for Magma alignment score")
+parser.add_argument("--pos-type", type=str, default="rope", choices=["rope", "rnope", "nope"], help="Positional encoding type")
+parser.add_argument("--doc-masking", action="store_true", help="Enable document-level attention masking")
 args = parser.parse_args()
 
 # Resolve output path
@@ -68,9 +76,14 @@ if args.output_json and not args.save_result:
 # =============================================================================
 
 # Architecture (defaults = d12 GPT-2 small)
-DEPTH = args.n_layer if args.n_layer is not None else 12
-N_EMBD = args.n_embd if args.n_embd is not None else 768
-N_HEAD = args.n_head if args.n_head is not None else 6
+if args.smoke_test:
+    DEPTH = 2
+    N_EMBD = 128
+    N_HEAD = 4
+else:
+    DEPTH = args.n_layer if args.n_layer is not None else 12
+    N_EMBD = args.n_embd if args.n_embd is not None else 768
+    N_HEAD = args.n_head if args.n_head is not None else 6
 HEAD_DIM = N_EMBD // N_HEAD
 MAX_SEQ_LEN = 2048
 WINDOW_PATTERN = "SSSL"
@@ -96,6 +109,11 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.4
 FINAL_LR_FRAC = 0.0
+
+# Magma-specific hyperparameters
+MAGMA_P = args.magma_p
+MAGMA_TAU = args.magma_tau
+MAGMA_BETA = args.magma_beta
 
 # =============================================================================
 # Utilities
@@ -134,9 +152,23 @@ def _load_fa3():
 
 _fa3 = _load_fa3()
 
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
-    return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), mask=None):
+    """Flash Attention for training (FA3 or SDPA fallback). q,k,v: (B, T, H, D)."""
+    # Use FA3 only if available and NO custom mask is provided (FA3 doesn't take masks)
+    if _fa3 is not None and mask is None:
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    else:
+        # Fallback to PyTorch native scaled_dot_product_attention
+        # (B, T, H, D) -> (B, H, T, D)
+        q_trans, k_trans, v_trans = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        
+        # SDPA handles causal and mask. If both are present, they are combined.
+        # Note: mask should be (B, 1, T, T) or (B, T, T)
+        if mask is not None and mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+            
+        y = F.scaled_dot_product_attention(q_trans, k_trans, v_trans, attn_mask=mask, is_causal=causal)
+        return y.transpose(1, 2).contiguous()
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
@@ -154,6 +186,7 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
+    pos_type: str = "rope"
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -169,8 +202,9 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, pos_type):
         super().__init__()
+        self.pos_type = pos_type
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
@@ -187,7 +221,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, mask=None):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -198,9 +232,10 @@ class CausalSelfAttention(nn.Module):
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        if self.pos_type == "rope":
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
-        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, mask=mask)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -219,13 +254,13 @@ class MLP(nn.Module):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, pos_type):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config, layer_idx, pos_type)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, mask=mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -240,7 +275,7 @@ class GPT(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab}")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config, i, self._get_pos_type(config, i)) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -307,6 +342,14 @@ class GPT(nn.Module):
         sizes[-1] = (long_w, 0)  # final layer always full context
         return sizes
 
+    def _get_pos_type(self, config, layer_idx):
+        if config.pos_type == "rope": return "rope"
+        if config.pos_type == "nope": return "nope"
+        if config.pos_type == "rnope":
+            # Interleave: Layer 0=NoPE, Layer 1=RoPE, ...
+            return "nope" if layer_idx % 2 == 0 else "rope"
+        return "rope"
+
     def get_device(self):
         return self.transformer.wte.weight.device
 
@@ -338,15 +381,19 @@ class GPT(nn.Module):
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
-                                     momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
+            if args.optimizer == "magma":
+                param_groups.append(dict(kind='magma', params=group_params, lr=MATRIX_LR,
+                                         momentum=0.95, tau=MAGMA_TAU, p=MAGMA_P, beta_magma=MAGMA_BETA, weight_decay=WEIGHT_DECAY))
+            else:
+                param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
+                                         momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
 
         optimizer = DistMuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
+    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end, mask=None):
         """Run decoder layers [start, end), with U-Net skip connections."""
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
@@ -355,7 +402,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], mask=mask)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
@@ -364,30 +411,37 @@ class GPT(nn.Module):
         x = norm(self.transformer.wte(idx))
         x0 = x
 
+        # Document masking logic
+        attn_mask = None
+        if args.doc_masking:
+            # EOT token ID for GPT-2 tokenizer is 50256
+            doc_ids = (idx == 50256).to(torch.int32).cumsum(dim=1)
+            # Create a block-diagonal mask: (B, T, T)
+            attn_mask = (doc_ids.unsqueeze(1) == doc_ids.unsqueeze(2))
+
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], mask=attn_mask)
             encoder_outputs.append(x)
 
         # Decoder half
         dupe = self._dupe_layers
         if dupe is None:
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        self.encoder_layers, self.config.n_layer)
+                                        self.encoder_layers, self.config.n_layer, mask=attn_mask)
         else:
             # First pass: encoder boundary through end of dupe range
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        self.encoder_layers, dupe[1])
+                                        self.encoder_layers, dupe[1], mask=attn_mask)
             # Replay: run dupe range again with same skip connections
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        dupe[0], dupe[1])
+                                        dupe[0], dupe[1], mask=attn_mask)
             # Remaining decoder layers
             x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        dupe[1], self.config.n_layer)
-
+                                        dupe[1], self.config.n_layer, mask=attn_mask)
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)
@@ -411,11 +465,12 @@ polar_express_coeffs = [
 
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
+    # Apply weight decay only where update and parameter signs align (CWD).
+    p.add_(p * ((exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t)) * p >= 0), alpha=-(lr_t * wd_t))
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -454,6 +509,48 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
+@torch.compile(dynamic=False, fullgraph=True)
+def magma_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer, alignment_score,
+                     momentum_t, lr_t, wd_t, beta2_t, tau_t, p_t, beta_magma_t):
+    # Standard momentum update
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    
+    # Adaptive update (RMSProp style)
+    beta2 = beta2_t.to(stacked_grads.dtype)
+    second_momentum_buffer.lerp_(stacked_grads.square(), 1 - beta2)
+    
+    # Alignment-based masking
+    eps = 1e-10
+    mu = momentum_buffer
+    g = stacked_grads
+    dot = (mu * g).sum(dim=(-2, -1), keepdim=True)
+    mu_norm = mu.norm(dim=(-2, -1), keepdim=True)
+    g_norm = g.norm(dim=(-2, -1), keepdim=True)
+    cos_sim = dot / (mu_norm * g_norm + eps)
+    
+    # s_tilde = sigmoid(cos_sim / tau)
+    s_tilde = torch.sigmoid(cos_sim / tau_t)
+    
+    # Update alignment score
+    alignment_score.lerp_(s_tilde.to(alignment_score.dtype), beta_magma_t)
+    
+    # Sample Bernoulli mask
+    mask = (torch.rand_like(s_tilde) < p_t).to(stacked_grads.dtype)
+    
+    # Final direction: g / (sqrt(v) + eps)
+    direction = g / (second_momentum_buffer.sqrt() + eps)
+    
+    # Masked update
+    update = direction * alignment_score.to(g.dtype) * (mask / p_t)
+    
+    lr = lr_t.to(stacked_params.dtype)
+    wd = wd_t.to(stacked_params.dtype)
+    
+    # Cautious Weight Decay
+    cwd_mask = (update * stacked_params) >= 0
+    stacked_params.sub_(lr * update + lr * wd * stacked_params * cwd_mask)
+
 class DistMuonAdamW(torch.optim.Optimizer):
     """Distributed MuonAdamW with ZeRO-2 style sharding."""
     def __init__(self, param_groups):
@@ -468,6 +565,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0)
         self._muon_wd_t = torch.tensor(0.0)
         self._muon_beta2_t = torch.tensor(0.0)
+        self._magma_tau_t = torch.tensor(0.0)
+        self._magma_p_t = torch.tensor(0.0)
+        self._magma_beta_t = torch.tensor(0.0)
 
     def _reduce_adamw(self, group, world_size):
         infos = {}
@@ -559,17 +659,110 @@ class DistMuonAdamW(torch.optim.Optimizer):
         future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
+    def _compute_magma(self, group, info, gather_list, rank):
+        info['future'].wait()
+        params = group['params']
+        chunk_size = info['chunk_size']
+        p = params[0]
+        shape, device, dtype = p.shape, p.device, p.dtype
+        start_idx = rank * chunk_size
+        num_owned = min(chunk_size, max(0, len(params) - start_idx))
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            state["second_momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+        if "alignment_score" not in state:
+            state["alignment_score"] = torch.full((chunk_size, 1, 1), 0.5, dtype=dtype, device=device)
+        updated = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        if num_owned > 0:
+            owned = torch.stack([params[start_idx + i] for i in range(num_owned)])
+            self._muon_momentum_t.fill_(group["momentum"])
+            self._muon_beta2_t.fill_(0.95) # Default beta2 for RMSProp base
+            self._magma_tau_t.fill_(group["tau"])
+            self._magma_p_t.fill_(group["p"])
+            self._magma_beta_t.fill_(group["beta_magma"])
+            self._muon_lr_t.fill_(group["lr"])
+            self._muon_wd_t.fill_(group["weight_decay"])
+            magma_step_fused(info['grad_chunk'][:num_owned], owned,
+                           state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned], state["alignment_score"][:num_owned],
+                           self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                           self._magma_tau_t, self._magma_p_t, self._magma_beta_t)
+            updated[:num_owned].copy_(owned)
+        if num_owned < chunk_size:
+            updated[num_owned:].zero_()
+        stacked_params = info["stacked_grads"]
+        future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
+        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+
     @torch.no_grad()
     def step(self):
+        if not dist.is_initialized():
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is None: continue
+                    state = self.state[p]
+                    if group['kind'] == 'adamw':
+                        if not state:
+                            state['step'] = 0
+                            state['exp_avg'] = torch.zeros_like(p)
+                            state['exp_avg_sq'] = torch.zeros_like(p)
+                        state['step'] += 1
+                        self._adamw_step_t.fill_(state['step'])
+                        self._adamw_lr_t.fill_(group['lr'])
+                        self._adamw_beta1_t.fill_(group['betas'][0])
+                        self._adamw_beta2_t.fill_(group['betas'][1])
+                        self._adamw_eps_t.fill_(group['eps'])
+                        self._adamw_wd_t.fill_(group['weight_decay'])
+                        adamw_step_fused(p, p.grad, state['exp_avg'], state['exp_avg_sq'],
+                                       self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                                       self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+                    elif group['kind'] == 'muon':
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                        if "second_momentum_buffer" not in state:
+                            shape = p.shape
+                            s = (1, shape[-2], 1) if shape[-2] >= shape[-1] else (1, 1, shape[-1])
+                            state["second_momentum_buffer"] = torch.zeros(s, dtype=p.dtype, device=p.device)
+                        red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
+                        self._muon_momentum_t.fill_(group["momentum"])
+                        self._muon_beta2_t.fill_(group["beta2"])
+                        self._muon_lr_t.fill_(group["lr"] * max(1.0, p.shape[-2] / p.shape[-1])**0.5)
+                        self._muon_wd_t.fill_(group["weight_decay"])
+                        muon_step_fused(p.grad.unsqueeze(0), p.unsqueeze(0),
+                                      state["momentum_buffer"].unsqueeze(0), state["second_momentum_buffer"],
+                                      self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                                      group["ns_steps"], red_dim)
+                    elif group['kind'] == 'magma':
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                        if "second_momentum_buffer" not in state:
+                            state["second_momentum_buffer"] = torch.zeros_like(p)
+                        if "alignment_score" not in state:
+                            state["alignment_score"] = torch.full((1, 1, 1), 0.5, dtype=p.dtype, device=p.device)
+                        self._muon_momentum_t.fill_(group["momentum"])
+                        self._muon_beta2_t.fill_(0.95)
+                        self._magma_tau_t.fill_(group["tau"])
+                        self._magma_p_t.fill_(group["p"])
+                        self._magma_beta_t.fill_(group["beta_magma"])
+                        self._muon_lr_t.fill_(group["lr"])
+                        self._muon_wd_t.fill_(group["weight_decay"])
+                        magma_step_fused(p.grad.unsqueeze(0), p.unsqueeze(0),
+                                       state["momentum_buffer"].unsqueeze(0), state["second_momentum_buffer"].unsqueeze(0), state["alignment_score"],
+                                       self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                                       self._magma_tau_t, self._magma_p_t, self._magma_beta_t)
+            return
+
         rank, world_size = dist.get_rank(), dist.get_world_size()
         reduce_infos = []
         for group in self.param_groups:
             if group['kind'] == 'adamw': reduce_infos.append(self._reduce_adamw(group, world_size))
-            elif group['kind'] == 'muon': reduce_infos.append(self._reduce_muon(group, world_size))
+            elif group['kind'] in ['muon', 'magma']: reduce_infos.append(self._reduce_muon(group, world_size))
         gather_list = []
         for group, info in zip(self.param_groups, reduce_infos):
             if group['kind'] == 'adamw': self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon': self._compute_muon(group, info, gather_list, rank)
+            elif group['kind'] == 'magma': self._compute_magma(group, info, gather_list, rank)
         for info in gather_list:
             info["future"].wait()
             if info.get("params") is not None:
@@ -582,24 +775,34 @@ class DataLoader:
     """Pre-tokenized chunk dataloader. Yields (inputs, targets, epoch) forever."""
 
     def __init__(self, filepath, B, T, device="cuda"):
-        data = torch.load(filepath, weights_only=True)
-        chunks = data['chunks']
-        valid_counts = data['valid_counts']
-        file_B = data['batch_size']
-        sequence_size = data['sequence_size']
-        assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
+        if not os.path.exists(filepath):
+            print(f"Warning: data file {filepath} not found. Generating synthetic data for smoke test.")
+            # Generate 1M random tokens
+            num_tokens = 1_000_000
+            sequence_size = T + 1
+            num_seqs = num_tokens // sequence_size
+            all_seqs = torch.randint(0, 50257, (num_seqs, sequence_size), dtype=torch.long)
+            usable = num_seqs
+        else:
+            data = torch.load(filepath, weights_only=True)
+            chunks = data['chunks']
+            valid_counts = data['valid_counts']
+            file_B = data['batch_size']
+            sequence_size = data['sequence_size']
+            assert sequence_size == T + 1, f"Data sequence_size {sequence_size} != T+1={T+1}"
 
-        # Gather all valid sequences into one tensor
-        all_seqs = []
-        for chunk, vc in zip(chunks, valid_counts):
-            rows = chunk.view(file_B, sequence_size)[:vc]
-            all_seqs.append(rows)
-        all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
+            # Gather all valid sequences into one tensor
+            all_seqs = []
+            for chunk, vc in zip(chunks, valid_counts):
+                rows = chunk.view(file_B, sequence_size)[:vc]
+                all_seqs.append(rows)
+            all_seqs = torch.cat(all_seqs, dim=0).long()  # (N, T+1)
+            usable = len(all_seqs)
 
         # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
         seqs_per_step = B * world_size
-        num_steps = len(all_seqs) // seqs_per_step
+        num_steps = usable // seqs_per_step
         usable = num_steps * seqs_per_step
         all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
 
@@ -698,16 +901,26 @@ if device_type == "cuda":
 if _fa3 is not None:
     print0("Using Flash Attention 3 (Hopper GPU detected)")
 else:
-    raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
+    if args.smoke_test or device.type == "cpu":
+        print0("Flash Attention 3 not found. Using native attention fallback.")
+    else:
+        raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
 _wandb_kwargs = {"project": "nanochat", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
+
+if args.smoke_test:
+    os.environ["WANDB_MODE"] = "offline"
+
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
 if master_process:
-    wandb_run.log_code(".")
+    try:
+        wandb_run.log_code(".")
+    except Exception:
+        pass
 
 # Print hyperparameters
 print0(f"--- Hyperparameters ---")
@@ -797,6 +1010,8 @@ smooth_train_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 dupe_active = False
+if args.smoke_test:
+    eval_steps = min(eval_steps, 5)
 
 # Initial val evaluation
 model.eval()
@@ -856,6 +1071,10 @@ while current_epoch <= args.num_epochs:
     dupe_str = " [DUPE]" if dupe_active else ""
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+
+    if args.max_steps > 0 and step >= args.max_steps:
+        print0(f"Reached max steps {args.max_steps}. Stopping.")
+        break
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -921,4 +1140,3 @@ print0(f"Total wall time: {total_wall_time:.2f}s ({total_wall_time/60:.2f}m)")
 wandb_run.finish()
 if dist.is_initialized():
     dist.destroy_process_group()
-
